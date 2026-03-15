@@ -24,12 +24,12 @@ if (EXISTS ${picoVscode})
 endif()
 # ====================================================================================
 set(PICO_BOARD pico2_w CACHE STRING "Board type")
-set(PROGRAM_NAME HTTPServer)
+set(PROGRAM_NAME server)
 
 # Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
 
-project(HTTPServer C CXX ASM)
+project(server C CXX ASM)
 
 execute_process(COMMAND
     py makefsdata.py
@@ -41,21 +41,24 @@ pico_sdk_init()
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(HTTPServer HTTPServer.c )
+add_executable(server
+    server.c
+    dhcpserver.c
+    )
 
 target_include_directories(${PROGRAM_NAME} PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
 )
 
-pico_set_program_name(HTTPServer "HTTPServer")
-pico_set_program_version(HTTPServer "0.1")
+pico_set_program_name(server "server")
+pico_set_program_version(server "0.1")
 
 # Modify the below lines to enable/disable output over UART/USB
-pico_enable_stdio_uart(HTTPServer 0)
-pico_enable_stdio_usb(HTTPServer 1)
+pico_enable_stdio_uart(server 0)
+pico_enable_stdio_usb(server 1)
 
 # Add the standard library to the build
-target_link_libraries(HTTPServer
+target_link_libraries(server
         pico_stdlib
         pico_cyw43_arch_lwip_threadsafe_background
         pico_lwip
@@ -63,13 +66,13 @@ target_link_libraries(HTTPServer
         )
 
 # Add the standard include files to the build
-target_include_directories(HTTPServer PRIVATE
+target_include_directories(server PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}
 )
 
 # Add any user requested libraries
-target_link_libraries(HTTPServer 
+target_link_libraries(server 
 )
 
-pico_add_extra_outputs(HTTPServer)
+pico_add_extra_outputs(server)
 
