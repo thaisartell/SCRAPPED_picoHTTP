@@ -31,9 +31,24 @@ include(pico_sdk_import.cmake)
 
 project(server C CXX ASM)
 
-execute_process(COMMAND
-    py makefsdata.py
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+file(GLOB_RECURSE HTTPD_CONTENT_FILES CONFIGURE_DEPENDS
+    ${CMAKE_CURRENT_LIST_DIR}/html_files/*
+)
+
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_LIST_DIR}/htmldata.c
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/makefsdata.py
+    DEPENDS
+        ${CMAKE_CURRENT_LIST_DIR}/makefsdata.py
+        ${HTTPD_CONTENT_FILES}
     WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
+    VERBATIM
+)
+
+add_custom_target(generate_http_content
+    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/htmldata.c
 )
 
 # Initialise the Raspberry Pi Pico SDK
@@ -44,7 +59,10 @@ pico_sdk_init()
 add_executable(server
     server.c
     dhcpserver.c
+    dnserver.c
     )
+
+add_dependencies(server generate_http_content)
 
 target_include_directories(${PROGRAM_NAME} PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
@@ -75,4 +93,3 @@ target_link_libraries(server
 )
 
 pico_add_extra_outputs(server)
-
