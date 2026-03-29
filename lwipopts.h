@@ -48,6 +48,8 @@
 #define DHCP_DOES_ARP_CHECK         0
 #define LWIP_DHCP_DOES_ACD_CHECK    0
 #define LWIP_HTTPD_CGI              1
+#define LWIP_HTTPD_CUSTOM_FILES     1
+#define LWIP_HTTPD_FILE_EXTENSION   1
 
 #ifndef NDEBUG
 #define LWIP_DEBUG                  1
