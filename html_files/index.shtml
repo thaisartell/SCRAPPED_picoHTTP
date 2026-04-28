@@ -1,17 +1,93 @@
 <!DOCTYPE html>
 <html>
     <head>
-        <title>Pico 2 W Webserver</title>
+        <title>Pico 2 W Backup Scheduler</title>
     </head>
     <body>
-        <h1>Hello world!</h1>
-        <p>Sync state: <span id="sync-state">Loading...</span></p>
+        <h1>Daily Backup Scheduler</h1>
+        <p>Device clock: <span id="device-time">Waiting for browser time...</span></p>
+        <p>Schedule: <span id="schedule-summary">Loading...</span></p>
+        <p>Backup state: <span id="sync-state">Loading...</span></p>
         <p id="sync-message">Checking status...</p>
-        <button id="sync-button" type="button">Sync Folder Now</button>
+        <p>Last backup result: <span id="last-backup-result">Loading...</span></p>
+        <p id="last-backup-message">Checking backup history...</p>
+
+        <p>
+            <label>
+                <input id="schedule-enabled" type="checkbox">
+                Enable daily scheduled backup
+            </label>
+        </p>
+        <p>
+            <label for="schedule-time">Daily backup time:</label>
+            <input id="schedule-time" type="time" step="60" value="02:00">
+            <button id="schedule-save-button" type="button">Save Schedule</button>
+        </p>
+        <p id="schedule-save-message"></p>
+
+        <h2>Backup Power</h2>
+        <p>Power control GPIO <span id="power-pin">Loading...</span> requested output: <span id="power-output-state">Loading...</span></p>
+        <p>GPIO <span id="power-level-pin">Loading...</span> pad readback: <span id="power-output-level">Loading...</span></p>
+        <button id="power-button" type="button">Loading Power Control...</button>
+
         <script>
-            const syncButton = document.getElementById("sync-button");
+            const deviceTime = document.getElementById("device-time");
+            const scheduleSummary = document.getElementById("schedule-summary");
             const syncState = document.getElementById("sync-state");
             const syncMessage = document.getElementById("sync-message");
+            const lastBackupResult = document.getElementById("last-backup-result");
+            const lastBackupMessage = document.getElementById("last-backup-message");
+            const scheduleEnabled = document.getElementById("schedule-enabled");
+            const scheduleTime = document.getElementById("schedule-time");
+            const scheduleSaveButton = document.getElementById("schedule-save-button");
+            const scheduleSaveMessage = document.getElementById("schedule-save-message");
+            const powerButton = document.getElementById("power-button");
+            const powerPin = document.getElementById("power-pin");
+            const powerLevelPin = document.getElementById("power-level-pin");
+            const powerOutputState = document.getElementById("power-output-state");
+            const powerOutputLevel = document.getElementById("power-output-level");
+            let currentPowerOutput = "OFF";
+
+            function pad2(value) {
+                return String(value).padStart(2, "0");
+            }
+
+            function formatScheduleSummary(enabled, hour, minute) {
+                const timeText = `${pad2(hour)}:${pad2(minute)}`;
+                if (enabled) {
+                    return `Enabled daily at ${timeText}`;
+                }
+
+                return `Disabled (saved time ${timeText})`;
+            }
+
+            function browserLocalEpochSeconds() {
+                const now = new Date();
+                return Math.floor((Date.now() - (now.getTimezoneOffset() * 60000)) / 1000);
+            }
+
+            async function syncBrowserTime() {
+                try {
+                    await fetch(`/time.cgi?localEpoch=${browserLocalEpochSeconds()}`, { cache: "no-store" });
+                } catch (error) {
+                }
+            }
+
+            async function loadSchedule() {
+                try {
+                    const response = await fetch("/schedule", { cache: "no-store" });
+                    if (!response.ok) {
+                        throw new Error("Schedule unavailable");
+                    }
+
+                    const schedule = await response.json();
+                    scheduleEnabled.checked = !!schedule.enabled;
+                    scheduleTime.value = `${pad2(schedule.hour)}:${pad2(schedule.minute)}`;
+                    scheduleSummary.textContent = formatScheduleSummary(schedule.enabled, schedule.hour, schedule.minute);
+                } catch (error) {
+                    scheduleSummary.textContent = "Schedule unavailable";
+                }
+            }
 
             async function refreshStatus() {
                 try {
@@ -21,29 +97,88 @@
                     }
 
                     const status = await response.json();
+                    deviceTime.textContent = status.clockValid ? status.currentLocalTime : "Waiting for browser time";
+                    scheduleSummary.textContent = formatScheduleSummary(status.scheduleEnabled, status.scheduleHour, status.scheduleMinute);
                     syncState.textContent = status.state;
                     syncMessage.textContent = status.message;
-                    syncButton.disabled = status.state !== "IDLE";
+                    lastBackupResult.textContent = status.lastBackupResult;
+                    lastBackupMessage.textContent = status.lastBackupMessage;
+                    currentPowerOutput = status.powerOutput === "ON" ? "ON" : "OFF";
+                    powerPin.textContent = status.powerOutputPin;
+                    powerLevelPin.textContent = status.powerOutputPin;
+                    powerOutputState.textContent = currentPowerOutput;
+                    powerOutputLevel.textContent = status.powerOutputLevel;
+                    powerButton.textContent = currentPowerOutput === "ON"
+                        ? `Cancel Backup and Power Off GPIO ${status.powerOutputPin}`
+                        : `Start Backup on GPIO ${status.powerOutputPin}`;
+                    powerButton.disabled = false;
                 } catch (error) {
+                    deviceTime.textContent = "Unavailable";
+                    scheduleSummary.textContent = "Unavailable";
                     syncState.textContent = "ERROR";
                     syncMessage.textContent = "Status unavailable";
-                    syncButton.disabled = false;
+                    lastBackupResult.textContent = "UNKNOWN";
+                    lastBackupMessage.textContent = "Backup history unavailable";
+                    powerPin.textContent = "UNKNOWN";
+                    powerLevelPin.textContent = "UNKNOWN";
+                    powerOutputState.textContent = "UNKNOWN";
+                    powerOutputLevel.textContent = "UNKNOWN";
+                    powerButton.textContent = "Start Backup";
+                    powerButton.disabled = false;
                 }
             }
 
-            syncButton.addEventListener("click", async () => {
-                syncButton.disabled = true;
+            scheduleSaveButton.addEventListener("click", async () => {
+                const timeValue = scheduleTime.value || "02:00";
+                const [hourText, minuteText] = timeValue.split(":");
+                const hour = Number(hourText);
+                const minute = Number(minuteText);
+
+                if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+                    scheduleSaveMessage.textContent = "Enter a valid daily time.";
+                    return;
+                }
+
+                scheduleSaveButton.disabled = true;
+                scheduleSaveMessage.textContent = "Saving schedule...";
 
                 try {
-                    await fetch("/sync.cgi", { cache: "no-store" });
+                    await syncBrowserTime();
+                    await fetch(
+                        `/schedule.cgi?enabled=${scheduleEnabled.checked ? 1 : 0}&hour=${hour}&minute=${minute}`,
+                        { cache: "no-store" }
+                    );
+                    scheduleSaveMessage.textContent = "Schedule saved.";
+                    await loadSchedule();
+                    await refreshStatus();
+                } catch (error) {
+                    scheduleSaveMessage.textContent = "Unable to save schedule.";
+                }
+
+                scheduleSaveButton.disabled = false;
+            });
+
+            powerButton.addEventListener("click", async () => {
+                powerButton.disabled = true;
+
+                try {
+                    const nextState = currentPowerOutput === "ON" ? "off" : "on";
+                    await fetch(`/gpio.cgi?state=${nextState}`, { cache: "no-store" });
                 } catch (error) {
                 }
 
-                refreshStatus();
+                await refreshStatus();
             });
 
-            refreshStatus();
+            async function initializePage() {
+                await syncBrowserTime();
+                await loadSchedule();
+                await refreshStatus();
+            }
+
+            initializePage();
             setInterval(refreshStatus, 1000);
+            setInterval(syncBrowserTime, 60000);
         </script>
     </body>
 </html>
