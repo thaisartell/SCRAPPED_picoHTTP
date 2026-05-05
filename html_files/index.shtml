@@ -28,7 +28,20 @@
         <h2>Backup Power</h2>
         <p>Power control GPIO <span id="power-pin">Loading...</span> requested output: <span id="power-output-state">Loading...</span></p>
         <p>GPIO <span id="power-level-pin">Loading...</span> pad readback: <span id="power-output-level">Loading...</span></p>
+        <p>
+            <label>
+                <input id="auto-power-off" type="checkbox">
+                Automatically power off after COMPLETE
+            </label>
+        </p>
+        <p id="auto-power-off-message"></p>
         <button id="power-button" type="button">Loading Power Control...</button>
+
+        <h2>Status Input</h2>
+        <p>Status GPIO <span id="status-pin">Loading...</span> pad readback: <span id="status-level">Loading...</span></p>
+        <p>GPIO IRQs: <span id="status-irq-count">0</span> total, <span id="status-rise-count">0</span> rise, <span id="status-fall-count">0</span> fall</p>
+        <p>Decoded pulses: <span id="status-decoded-count">0</span>; ignored widths: <span id="status-ignored-width-count">0</span>; fall without rise: <span id="status-no-rise-count">0</span></p>
+        <p>Last pulse: <span id="status-last-width">0</span> us, decoded as <span id="status-last-decoded">NONE</span></p>
 
         <script>
             const deviceTime = document.getElementById("device-time");
@@ -41,12 +54,25 @@
             const scheduleTime = document.getElementById("schedule-time");
             const scheduleSaveButton = document.getElementById("schedule-save-button");
             const scheduleSaveMessage = document.getElementById("schedule-save-message");
+            const autoPowerOff = document.getElementById("auto-power-off");
+            const autoPowerOffMessage = document.getElementById("auto-power-off-message");
             const powerButton = document.getElementById("power-button");
             const powerPin = document.getElementById("power-pin");
             const powerLevelPin = document.getElementById("power-level-pin");
             const powerOutputState = document.getElementById("power-output-state");
             const powerOutputLevel = document.getElementById("power-output-level");
+            const statusPin = document.getElementById("status-pin");
+            const statusLevel = document.getElementById("status-level");
+            const statusIrqCount = document.getElementById("status-irq-count");
+            const statusRiseCount = document.getElementById("status-rise-count");
+            const statusFallCount = document.getElementById("status-fall-count");
+            const statusDecodedCount = document.getElementById("status-decoded-count");
+            const statusIgnoredWidthCount = document.getElementById("status-ignored-width-count");
+            const statusNoRiseCount = document.getElementById("status-no-rise-count");
+            const statusLastWidth = document.getElementById("status-last-width");
+            const statusLastDecoded = document.getElementById("status-last-decoded");
             let currentPowerOutput = "OFF";
+            let currentAutoPowerOff = true;
 
             function pad2(value) {
                 return String(value).padStart(2, "0");
@@ -104,10 +130,23 @@
                     lastBackupResult.textContent = status.lastBackupResult;
                     lastBackupMessage.textContent = status.lastBackupMessage;
                     currentPowerOutput = status.powerOutput === "ON" ? "ON" : "OFF";
+                    currentAutoPowerOff = status.autoPowerOff !== false;
+                    autoPowerOff.checked = currentAutoPowerOff;
+                    autoPowerOff.disabled = false;
                     powerPin.textContent = status.powerOutputPin;
                     powerLevelPin.textContent = status.powerOutputPin;
                     powerOutputState.textContent = currentPowerOutput;
                     powerOutputLevel.textContent = status.powerOutputLevel;
+                    statusPin.textContent = status.statusInputPin;
+                    statusLevel.textContent = status.statusInputLevel;
+                    statusIrqCount.textContent = status.statusIrqCount;
+                    statusRiseCount.textContent = status.statusRiseCount;
+                    statusFallCount.textContent = status.statusFallCount;
+                    statusDecodedCount.textContent = status.statusDecodedCount;
+                    statusIgnoredWidthCount.textContent = status.statusIgnoredWidthCount;
+                    statusNoRiseCount.textContent = status.statusNoRiseCount;
+                    statusLastWidth.textContent = status.statusLastPulseWidthUs;
+                    statusLastDecoded.textContent = status.statusLastDecoded;
                     powerButton.textContent = currentPowerOutput === "ON"
                         ? `Cancel Backup and Power Off GPIO ${status.powerOutputPin}`
                         : `Start Backup on GPIO ${status.powerOutputPin}`;
@@ -123,6 +162,18 @@
                     powerLevelPin.textContent = "UNKNOWN";
                     powerOutputState.textContent = "UNKNOWN";
                     powerOutputLevel.textContent = "UNKNOWN";
+                    statusPin.textContent = "UNKNOWN";
+                    statusLevel.textContent = "UNKNOWN";
+                    statusIrqCount.textContent = "UNKNOWN";
+                    statusRiseCount.textContent = "UNKNOWN";
+                    statusFallCount.textContent = "UNKNOWN";
+                    statusDecodedCount.textContent = "UNKNOWN";
+                    statusIgnoredWidthCount.textContent = "UNKNOWN";
+                    statusNoRiseCount.textContent = "UNKNOWN";
+                    statusLastWidth.textContent = "UNKNOWN";
+                    statusLastDecoded.textContent = "UNKNOWN";
+                    autoPowerOff.checked = currentAutoPowerOff;
+                    autoPowerOff.disabled = false;
                     powerButton.textContent = "Start Backup";
                     powerButton.disabled = false;
                 }
@@ -156,6 +207,20 @@
                 }
 
                 scheduleSaveButton.disabled = false;
+            });
+
+            autoPowerOff.addEventListener("change", async () => {
+                autoPowerOff.disabled = true;
+                autoPowerOffMessage.textContent = "Saving power-off option...";
+
+                try {
+                    await fetch(`/auto-power-off.cgi?enabled=${autoPowerOff.checked ? 1 : 0}`, { cache: "no-store" });
+                    autoPowerOffMessage.textContent = "Power-off option saved.";
+                } catch (error) {
+                    autoPowerOffMessage.textContent = "Unable to save power-off option.";
+                }
+
+                await refreshStatus();
             });
 
             powerButton.addEventListener("click", async () => {

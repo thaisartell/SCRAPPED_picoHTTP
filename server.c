@@ -50,7 +50,7 @@ static const char WIFI_PASSWORD[] = "LuBrRaJaTh";
 #define DNS_SERVER_PORT 53
 
 /* ---------------- GPIO ---------------- */
-#define PI_STATUS_INPUT_GPIO 27
+#define PI_STATUS_INPUT_GPIO 18
 #define PI_POWER_ENABLE_GPIO 26
 
 /* ---------------- Pi Status ----------------
@@ -70,10 +70,10 @@ System error: 35ms */
 #define PI_STATUS_SYSTEM_ERROR_MIN_US 33000
 #define PI_STATUS_SYSTEM_ERROR_MAX_US 37000
 #define SYNC_RESULT_DISPLAY_DELAY_MS 2000
-#define PI_READY_TIMEOUT_MS (5 * 60 * 1000)
+#define PI_READY_TIMEOUT_MS (10 * 60 * 1000)
 
 /* ---------------- General ---------------- */
-#define STATUS_RESPONSE_BUFFER_SIZE 1536
+#define STATUS_RESPONSE_BUFFER_SIZE 2048
 #define SCHEDULE_RESPONSE_BUFFER_SIZE 256
 #define LOCAL_TIME_BUFFER_SIZE 16
 #define RESULT_TEXT_BUFFER_SIZE 24
@@ -125,9 +125,19 @@ static volatile uint64_t pi_status_rise_us = 0;
 static volatile uint32_t pi_status_width_us = 0;
 static volatile int pi_status_ready = 0;
 static volatile pi_status_t pi_decoded_status = PI_STATUS_NONE;
+static volatile uint32_t pi_status_irq_count = 0;
+static volatile uint32_t pi_status_rise_count = 0;
+static volatile uint32_t pi_status_fall_count = 0;
+static volatile uint32_t pi_status_decoded_count = 0;
+static volatile uint32_t pi_status_ignored_width_count = 0;
+static volatile uint32_t pi_status_no_rise_count = 0;
+static volatile uint32_t pi_status_last_width_us = 0;
+static volatile pi_status_t pi_status_last_decoded = PI_STATUS_NONE;
 static volatile int pi_power_output_enabled = 0;
+static volatile int automatic_power_off_enabled = 1;
 static volatile int pi_ready_for_sync = 0;
 static volatile int sync_run_active = 0;
+static volatile int completed_power_hold_active = 0;
 
 static backup_schedule_t backup_schedule = {0, 2, 0};
 static int schedule_persistence_available = 0;
@@ -141,6 +151,7 @@ static char last_backup_message[RESULT_MESSAGE_BUFFER_SIZE] = "No scheduled back
 
 /* Timestamp (ms) until sync state transition */
 static absolute_time_t sync_next_transition_at;
+static absolute_time_t completed_power_hold_until;
 
 static const char HTTP_SERVER_HEADER[] = "Server: lwIP/pre-0.6 (http://www.sics.se/~adam/lwip/)\r\n";
 static const char JSON_RESPONSE_HEADER[] =
@@ -501,6 +512,10 @@ static void pi_power_output_set_enabled(int enabled) {
 
     pi_status_reset_snapshot();
     pi_ready_for_sync = 0;
+    if (!enabled) {
+        completed_power_hold_active = 0;
+        completed_power_hold_until = at_the_end_of_time;
+    }
     gpio_put(PI_POWER_ENABLE_GPIO, enabled ? 1 : 0);
     pi_power_output_enabled = enabled ? 1 : 0;
 
@@ -520,6 +535,25 @@ static int pi_power_output_get_enabled(void) {
     uint32_t interrupt_state = save_and_disable_interrupts();
 
     enabled = pi_power_output_enabled;
+
+    restore_interrupts(interrupt_state);
+    return enabled;
+}
+
+static void automatic_power_off_set_enabled(int enabled) {
+    uint32_t interrupt_state = save_and_disable_interrupts();
+
+    automatic_power_off_enabled = enabled ? 1 : 0;
+
+    restore_interrupts(interrupt_state);
+    printf("automatic power off after COMPLETE -> %s\n", enabled ? "enabled" : "disabled");
+}
+
+static int automatic_power_off_get_enabled(void) {
+    int enabled;
+    uint32_t interrupt_state = save_and_disable_interrupts();
+
+    enabled = automatic_power_off_enabled;
 
     restore_interrupts(interrupt_state);
     return enabled;
@@ -561,14 +595,22 @@ static pi_status_t decode_pi_status_from_pulse_width(uint64_t width_us) {
     return PI_STATUS_NONE;
 }
 
+/*
+Occurs on GPIO27 interrupt.
+Pulse RISE: captures rising edge time.
+Pulse FALL: compares falling edge time against old rising edge time. Sends captured pulse length to be decoded.
+*/
 static void pi_status_gpio_irq_handler(uint gpio, uint32_t events) {
     uint64_t now = time_us_64();
+
+    pi_status_irq_count++;
 
     if (gpio != PI_STATUS_INPUT_GPIO) {
         return;
     }
 
     if (events & GPIO_IRQ_EDGE_RISE) {
+        pi_status_rise_count++;
         pi_status_rise_us = now;
     }
 
@@ -576,18 +618,24 @@ static void pi_status_gpio_irq_handler(uint gpio, uint32_t events) {
         uint64_t width_us;
         pi_status_t decoded_status;
 
+        pi_status_fall_count++;
         if (pi_status_rise_us == 0) {
+            pi_status_no_rise_count++;
             return;
         }
 
         width_us = now - pi_status_rise_us;
+        pi_status_last_width_us = (uint32_t)width_us;
         decoded_status = decode_pi_status_from_pulse_width(width_us);
+        pi_status_last_decoded = decoded_status;
         if (decoded_status == PI_STATUS_NONE) {
+            pi_status_ignored_width_count++;
             return;
         }
 
         pi_status_width_us = (uint32_t)width_us;
         pi_decoded_status = decoded_status;
+        pi_status_decoded_count++;
         pi_status_ready = 1;
     }
 }
@@ -598,10 +646,13 @@ static void sync_initialize(void) {
     sync_state = SYNC_STATE_IDLE;
     snprintf(sync_status_message, sizeof(sync_status_message), "%s", "Ready");
     sync_next_transition_at = at_the_end_of_time;
+    completed_power_hold_until = at_the_end_of_time;
     pi_status_reset_snapshot();
     pi_power_output_enabled = 0;
+    automatic_power_off_enabled = 1;
     pi_ready_for_sync = 0;
     sync_run_active = 0;
+    completed_power_hold_active = 0;
 
     restore_interrupts(interrupt_state);
 }
@@ -620,9 +671,16 @@ static void sync_set_state(sync_state_t new_state, const char *message, absolute
     printf("sync state -> %s: %s\n", sync_state_name(new_state), message_copy);
 }
 
+static int completed_power_hold_get_active(void);
+
 static void sync_set_idle_wait_message(void) {
     if (!pi_power_output_get_enabled()) {
         sync_set_state(SYNC_STATE_IDLE, "Power control output is OFF", at_the_end_of_time);
+        return;
+    }
+
+    if (completed_power_hold_get_active()) {
+        sync_set_state(SYNC_STATE_IDLE, "Backup complete; power left on", at_the_end_of_time);
         return;
     }
 
@@ -671,6 +729,38 @@ static int sync_is_run_active(void) {
     return active;
 }
 
+static void completed_power_hold_start(absolute_time_t hold_until) {
+    if (is_at_the_end_of_time(hold_until) || time_reached(hold_until)) {
+        hold_until = make_timeout_time_ms(BACKUP_WINDOW_TIMEOUT_MS);
+    }
+
+    uint32_t interrupt_state = save_and_disable_interrupts();
+
+    completed_power_hold_active = 1;
+    completed_power_hold_until = hold_until;
+
+    restore_interrupts(interrupt_state);
+}
+
+static void completed_power_hold_clear(void) {
+    uint32_t interrupt_state = save_and_disable_interrupts();
+
+    completed_power_hold_active = 0;
+    completed_power_hold_until = at_the_end_of_time;
+
+    restore_interrupts(interrupt_state);
+}
+
+static int completed_power_hold_get_active(void) {
+    int active;
+    uint32_t interrupt_state = save_and_disable_interrupts();
+
+    active = completed_power_hold_active;
+
+    restore_interrupts(interrupt_state);
+    return active;
+}
+
 static int sync_start_backup_run(const char *message) {
     sync_state_t current_state;
     uint32_t interrupt_state = save_and_disable_interrupts();
@@ -683,19 +773,30 @@ static int sync_start_backup_run(const char *message) {
         return 0;
     }
 
+    completed_power_hold_clear();
     sync_set_run_active(1);
 
     if (!pi_power_output_get_enabled()) {
         pi_power_output_set_enabled(1);
     }
 
-    sync_set_state(SYNC_STATE_WAITING_READY, message, make_timeout_time_ms(PI_READY_TIMEOUT_MS));
+    sync_set_state(SYNC_STATE_TRANSFERRING, message, make_timeout_time_ms(BACKUP_WINDOW_TIMEOUT_MS));
     return 1;
 }
 
-static void sync_finish_run(sync_state_t final_state, const char *state_message, const char *result, const char *result_message) {
+static void sync_finish_run(sync_state_t final_state, const char *state_message, const char *result, const char *result_message, int power_off_after_run) {
+    absolute_time_t power_hold_until;
+    uint32_t interrupt_state = save_and_disable_interrupts();
+
+    power_hold_until = sync_next_transition_at;
+    restore_interrupts(interrupt_state);
+
     sync_set_run_active(0);
-    pi_power_output_set_enabled(0);
+    if (power_off_after_run) {
+        pi_power_output_set_enabled(0);
+    } else {
+        completed_power_hold_start(power_hold_until);
+    }
 
     last_backup_set(result, result_message);
     sync_set_state(final_state, state_message, make_timeout_time_ms(SYNC_RESULT_DISPLAY_DELAY_MS));
@@ -706,7 +807,7 @@ static void sync_cancel_run(const char *reason) {
         return;
     }
 
-    sync_finish_run(SYNC_STATE_ERROR, reason, "CANCELLED", reason);
+    sync_finish_run(SYNC_STATE_ERROR, reason, "CANCELLED", reason, 1);
 }
 
 /* Pi communication initialization:
@@ -746,7 +847,7 @@ static int pi_status_take_snapshot(pi_status_t *status, uint32_t *width_us) {
 }
 
 static void sync_request(void) {
-    sync_start_backup_run("Manual backup power cycle requested");
+    sync_start_backup_run("Manual backup started");
 }
 
 static void sync_process_pi_status(void) {
@@ -755,6 +856,7 @@ static void sync_process_pi_status(void) {
     uint32_t pulse_width_us;
     uint32_t interrupt_state;
     int power_output_enabled;
+    int power_hold_active;
 
     if (!pi_status_take_snapshot(&pi_status, &pulse_width_us)) {
         return;
@@ -764,6 +866,7 @@ static void sync_process_pi_status(void) {
     current_state = sync_state;
     restore_interrupts(interrupt_state);
     power_output_enabled = pi_power_output_get_enabled();
+    power_hold_active = completed_power_hold_get_active();
 
     printf("pi status -> %s (%u us)\n", pi_status_name(pi_status), pulse_width_us);
 
@@ -778,6 +881,10 @@ static void sync_process_pi_status(void) {
             }
             pi_ready_for_sync_set(1);
             if (current_state == SYNC_STATE_IDLE) {
+                if (power_hold_active) {
+                    sync_set_idle_wait_message();
+                    break;
+                }
                 sync_set_run_active(1);
                 sync_set_state(
                     SYNC_STATE_TRANSFERRING,
@@ -796,21 +903,36 @@ static void sync_process_pi_status(void) {
             );
             break;
         case PI_STATUS_COMPLETE:
+        {
+            int power_off_after_complete;
+
             if (!power_output_enabled) {
                 break;
             }
-            if ((current_state != SYNC_STATE_IDLE) &&
-                (current_state != SYNC_STATE_WAITING_READY) &&
-                (current_state != SYNC_STATE_TRANSFERRING)) {
+            if (power_hold_active) {
                 break;
             }
+            if (current_state != SYNC_STATE_TRANSFERRING) {
+                printf(
+                    "pi status COMPLETE ignored while sync state is %s; no active transfer\n",
+                    sync_state_name(current_state)
+                );
+                break;
+            }
+
+            power_off_after_complete = automatic_power_off_get_enabled();
+
             sync_finish_run(
                 SYNC_STATE_SUCCESS,
-                "Backup completed successfully; power removed",
+                power_off_after_complete ? "Backup completed successfully; power removed" : "Backup complete; power left on",
                 "SUCCESS",
-                "Raspberry Pi reported backup complete"
+                power_off_after_complete
+                    ? "Raspberry Pi reported backup complete"
+                    : "Raspberry Pi reported backup complete; automatic power-off disabled",
+                power_off_after_complete
             );
             break;
+        }
         case PI_STATUS_SYNCTHING_ERROR:
             pi_ready_for_sync_set(0);
             if (!power_output_enabled) {
@@ -825,7 +947,8 @@ static void sync_process_pi_status(void) {
                 SYNC_STATE_ERROR,
                 "Backup failed: SyncThing error",
                 "SYNCTHING_ERROR",
-                "Raspberry Pi reported a SyncThing error"
+                "Raspberry Pi reported a SyncThing error",
+                1
             );
             break;
         case PI_STATUS_SYSTEM_ERROR:
@@ -842,7 +965,8 @@ static void sync_process_pi_status(void) {
                 SYNC_STATE_ERROR,
                 "Backup failed: system error",
                 "SYSTEM_ERROR",
-                "Raspberry Pi reported a system error"
+                "Raspberry Pi reported a system error",
+                1
             );
             break;
         case PI_STATUS_NONE:
@@ -891,9 +1015,27 @@ static void scheduled_backup_poll(void) {
         return;
     }
 
-    if (!sync_start_backup_run("Scheduled backup started: waiting for Raspberry Pi ready")) {
+    if (!sync_start_backup_run("Scheduled backup started")) {
         last_backup_set("SKIPPED", "Scheduled backup could not start");
     }
+}
+
+static void completed_power_hold_poll(void) {
+    int hold_active;
+    absolute_time_t hold_until;
+    uint32_t interrupt_state = save_and_disable_interrupts();
+
+    hold_active = completed_power_hold_active;
+    hold_until = completed_power_hold_until;
+
+    restore_interrupts(interrupt_state);
+
+    if (!hold_active || !time_reached(hold_until)) {
+        return;
+    }
+
+    pi_power_output_set_enabled(0);
+    sync_set_state(SYNC_STATE_IDLE, "Completed backup power hold expired; power removed", at_the_end_of_time);
 }
 
 static void sync_poll_state_machine(void) {
@@ -909,28 +1051,32 @@ static void sync_poll_state_machine(void) {
     restore_interrupts(interrupt_state);
 
     if (current_state == SYNC_STATE_IDLE) {
+        completed_power_hold_poll();
         return;
     }
 
     if (!time_reached(next_transition_at)) {
+        completed_power_hold_poll();
         return;
     }
 
     if (current_state == SYNC_STATE_WAITING_READY) {
         timeout_message = "Timed out waiting for Raspberry Pi ready";
-        sync_finish_run(SYNC_STATE_TIMEOUT, timeout_message, "TIMEOUT", timeout_message);
+        sync_finish_run(SYNC_STATE_TIMEOUT, timeout_message, "TIMEOUT", timeout_message, 1);
         return;
     }
 
     if (current_state == SYNC_STATE_TRANSFERRING) {
         timeout_message = "Backup window timed out";
-        sync_finish_run(SYNC_STATE_TIMEOUT, timeout_message, "TIMEOUT", timeout_message);
+        sync_finish_run(SYNC_STATE_TIMEOUT, timeout_message, "TIMEOUT", timeout_message, 1);
         return;
     }
 
     if ((current_state == SYNC_STATE_SUCCESS) || (current_state == SYNC_STATE_ERROR) || (current_state == SYNC_STATE_TIMEOUT)) {
         sync_set_idle_wait_message();
     }
+
+    completed_power_hold_poll();
 }
 
 static const char *find_query_value(const char *name, int iNumParams, char *pcParam[], char *pcValue[]) {
@@ -1020,7 +1166,7 @@ static const char *gpio_request_cgi_handler(int iIndex, int iNumParams, char *pc
     );
 
     if (next_output_enabled) {
-        sync_start_backup_run("Manual backup started: waiting for Raspberry Pi alive status");
+        sync_start_backup_run("Manual backup started");
     } else if (sync_is_run_active()) {
         sync_cancel_run("Backup cancelled by manual GPIO power-off");
     } else {
@@ -1028,6 +1174,22 @@ static const char *gpio_request_cgi_handler(int iIndex, int iNumParams, char *pc
         sync_set_idle_wait_message();
     }
 
+    return "/success.txt";
+}
+
+static const char *auto_power_off_request_cgi_handler(int iIndex, int iNumParams, char *pcParam[], char *pcValue[]) {
+    const char *enabled_value;
+    int enabled;
+
+    (void)iIndex;
+
+    enabled_value = find_query_value("enabled", iNumParams, pcParam, pcValue);
+    if (!parse_int_query_value(enabled_value, 0, 1, &enabled)) {
+        printf("auto power-off CGI request ignored: invalid params\n");
+        return "/success.txt";
+    }
+
+    automatic_power_off_set_enabled(enabled);
     return "/success.txt";
 }
 
@@ -1075,6 +1237,7 @@ static const char *schedule_request_cgi_handler(int iIndex, int iNumParams, char
 static const tCGI cgi_handlers[] = {
     {"/sync.cgi", sync_request_cgi_handler},
     {"/gpio.cgi", gpio_request_cgi_handler},
+    {"/auto-power-off.cgi", auto_power_off_request_cgi_handler},
     {"/time.cgi", time_request_cgi_handler},
     {"/schedule.cgi", schedule_request_cgi_handler},
 };
@@ -1113,7 +1276,17 @@ static int build_status_json(char *json_body, size_t json_body_size) {
     char current_message[sizeof(sync_status_message)];
     int gpio_output_enabled;
     int gpio_output_level;
+    int status_input_level;
+    int auto_power_off_enabled;
     int ready_for_sync;
+    uint32_t status_irq_count;
+    uint32_t status_rise_count;
+    uint32_t status_fall_count;
+    uint32_t status_decoded_count;
+    uint32_t status_ignored_width_count;
+    uint32_t status_no_rise_count;
+    uint32_t status_last_width_us;
+    pi_status_t status_last_decoded;
     int schedule_enabled;
     int schedule_hour;
     int schedule_minute;
@@ -1127,7 +1300,19 @@ static int build_status_json(char *json_body, size_t json_body_size) {
     sync_get_snapshot(&current_state, current_message, sizeof(current_message));
     gpio_output_enabled = pi_power_output_get_enabled();
     gpio_output_level = pi_power_output_get_level();
+    status_input_level = gpio_get(PI_STATUS_INPUT_GPIO) ? 1 : 0;
+    auto_power_off_enabled = automatic_power_off_get_enabled();
     ready_for_sync = pi_ready_for_sync_get();
+    uint32_t interrupt_state = save_and_disable_interrupts();
+    status_irq_count = pi_status_irq_count;
+    status_rise_count = pi_status_rise_count;
+    status_fall_count = pi_status_fall_count;
+    status_decoded_count = pi_status_decoded_count;
+    status_ignored_width_count = pi_status_ignored_width_count;
+    status_no_rise_count = pi_status_no_rise_count;
+    status_last_width_us = pi_status_last_width_us;
+    status_last_decoded = pi_status_last_decoded;
+    restore_interrupts(interrupt_state);
     backup_schedule_get_snapshot(&schedule_enabled, &schedule_hour, &schedule_minute);
     format_schedule_time(schedule_hour, schedule_minute, schedule_time, sizeof(schedule_time));
     clock_valid = scheduler_clock_get_local_epoch(&current_local_epoch_sec);
@@ -1141,14 +1326,25 @@ static int build_status_json(char *json_body, size_t json_body_size) {
     return snprintf(
         json_body,
         json_body_size,
-        "{\"state\":\"%s\",\"message\":\"%s\",\"statusInputPin\":%d,\"powerOutputPin\":%d,\"powerOutput\":\"%s\",\"powerOutputLevel\":\"%s\",\"powerOutputLevelValue\":%d,\"piReadyForSync\":%s,\"scheduleEnabled\":%s,\"scheduleHour\":%d,\"scheduleMinute\":%d,\"scheduleTime\":\"%s\",\"clockValid\":%s,\"currentLocalTime\":\"%s\",\"lastBackupResult\":\"%s\",\"lastBackupMessage\":\"%s\"}\n",
+        "{\"state\":\"%s\",\"message\":\"%s\",\"statusInputPin\":%d,\"statusInputLevel\":\"%s\",\"statusInputLevelValue\":%d,\"statusIrqCount\":%u,\"statusRiseCount\":%u,\"statusFallCount\":%u,\"statusDecodedCount\":%u,\"statusIgnoredWidthCount\":%u,\"statusNoRiseCount\":%u,\"statusLastPulseWidthUs\":%u,\"statusLastDecoded\":\"%s\",\"powerOutputPin\":%d,\"powerOutput\":\"%s\",\"powerOutputLevel\":\"%s\",\"powerOutputLevelValue\":%d,\"autoPowerOff\":%s,\"piReadyForSync\":%s,\"scheduleEnabled\":%s,\"scheduleHour\":%d,\"scheduleMinute\":%d,\"scheduleTime\":\"%s\",\"clockValid\":%s,\"currentLocalTime\":\"%s\",\"lastBackupResult\":\"%s\",\"lastBackupMessage\":\"%s\"}\n",
         sync_state_name(current_state),
         current_message,
         PI_STATUS_INPUT_GPIO,
+        gpio_level_name(status_input_level),
+        status_input_level,
+        status_irq_count,
+        status_rise_count,
+        status_fall_count,
+        status_decoded_count,
+        status_ignored_width_count,
+        status_no_rise_count,
+        status_last_width_us,
+        pi_status_name(status_last_decoded),
         PI_POWER_ENABLE_GPIO,
         gpio_output_state_name(gpio_output_enabled),
         gpio_level_name(gpio_output_level),
         gpio_output_level,
+        json_bool_name(auto_power_off_enabled),
         json_bool_name(ready_for_sync),
         json_bool_name(schedule_enabled),
         schedule_hour,
